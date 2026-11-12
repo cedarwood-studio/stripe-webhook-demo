@@ -46,7 +46,20 @@ def test_changed_timestamp_fails():
         signature.verify(BODY, f"t={T + 1},v1={digest}", TEST_SECRET, now=T + 1)
 
 
-@pytest.mark.parametrize("header", [None, "", "garbage", "t=abc,v1=00", f"t={T}", "v1=00"])
+@pytest.mark.parametrize(
+    "header",
+    [
+        None,
+        "",
+        "garbage",
+        "t=abc,v1=00",
+        f"t={T}",
+        "v1=00",
+        f"t={T},v1=\u00e9",  # non-ASCII: must be a clean rejection, not a TypeError
+        f"t=+{T},v1={signature.compute(BODY, TEST_SECRET, T)}",  # int() would take "+1"
+        f"t=1_800_000_000,v1={signature.compute(BODY, TEST_SECRET, T)}",  # and "1_0"
+    ],
+)
 def test_missing_or_malformed_header_fails(header):
     with pytest.raises(SignatureError):
         signature.verify(BODY, header, TEST_SECRET, now=T)

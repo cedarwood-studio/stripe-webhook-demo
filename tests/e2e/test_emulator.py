@@ -164,6 +164,26 @@ def test_request_signed_ten_minutes_ago_gets_400(stack):
     assert order(stack, session_id) is None
 
 
+def test_non_ascii_signature_gets_400_from_the_handler(stack):
+    # Needs no secret to send. The handler has to answer it, not crash on it.
+    event_id, session_id = ids("nonascii")
+    body, _ = signed(checkout_event(event_id, session_id), int(time.time()))
+    request = urllib.request.Request(  # noqa: S310
+        stack["url"],
+        data=body,
+        headers={"content-type": "application/json", "Stripe-Signature": "t=1,v1=\u00e9"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, context=stack["tls"], timeout=30) as r:  # noqa: S310
+            code, text = r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        code, text = e.code, e.read().decode(errors="replace")
+    print(f"\nnon-ASCII signature: {code} {text}")
+    assert (code, text) == (400, '{"error": "invalid signature"}')
+    assert order(stack, session_id) is None
+
+
 # -- orders -------------------------------------------------------------------
 
 

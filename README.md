@@ -22,8 +22,8 @@ Stripe --POST /webhooks/stripe--> HTTP API --> webhook Lambda --> DynamoDB (even
 - **One event, one effect** (`src/orders/store.py`, `claim_event`). Each Stripe event id is claimed with a DynamoDB conditional write. A redelivered event finds the record and returns 200 without doing anything.
 - **One checkout, one order** (`apply_status`, `claim_enqueue`). Stripe can send two different events for one payment, so the event id is not enough. The order is keyed by the Checkout session id, and a second conditional write lets exactly one caller queue it.
 - **Out of order events** (`STATUS_RANK`). An order only moves up: awaiting payment, payment failed, paid. An event that would move it down or sideways arrived late and changes nothing.
-- **Partial failure**. The event claim is a 60 second lease, not a permanent mark. If the queue send fails, the handler gives the claim back and returns 500, and Stripe's retry finishes the job. If the Lambda dies mid-event, a later delivery takes over once the lease runs out. Any paid event for an order that is paid but not yet queued will queue it.
-- **Dead-letter path, two ways in**. A correctly signed event the handler cannot turn into an order (no amount, an unknown payment status) is put on the dead-letter queue with the reason and the full event, and Stripe gets a 200 so it stops retrying. A message the consumer cannot process is redelivered by SQS and moved to the same queue after three receives.
+- **Partial failure**. The event claim is a lease that runs out after 60 seconds. If the queue send fails, the handler gives the claim back and returns 500, and Stripe's retry finishes the job. If the Lambda dies mid-event, a later delivery takes over once the lease runs out. Any paid event for an order that is paid but not yet queued will queue it.
+- **Dead-letter path, two ways in**. A correctly signed event the handler cannot turn into an order (no amount, an unknown payment status, a payload of the wrong shape) is put on the dead-letter queue with the reason and the full event, and Stripe gets a 200 so it stops retrying. A message the consumer cannot process is redelivered by SQS and moved to the same queue after three receives.
 - **The consumer** (`src/orders/consumer.py`) is a stand-in for the step that would place a print job. It places nothing. It shows that a redelivered message does not run the step twice.
 
 Event types handled: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`. Any other type gets a 200 and is ignored.
@@ -45,21 +45,22 @@ If the message is sent to SQS and the write that records the send then fails, th
 
 All results below are from one run on 2026-11-12, on a 4-core arm64 Linux machine with 8 GB of memory.
 
-### Unit tests: 49 passed
+### Unit tests: 55 passed
 
-`pytest`, 49 tests in about 4 seconds. The handler runs in-process against moto's in-memory DynamoDB and SQS, with a clock the tests control. These also run in CI on every push.
+`pytest`, 55 tests in about 5 seconds. The handler runs in-process against moto's in-memory DynamoDB and SQS, with a clock the tests control. These also run in CI on every push.
 
-- **Signature (17 tests):** a valid signature passes; a wrong secret, a changed body, a re-serialized body, a changed timestamp, a missing or malformed header (6 cases), a `v0`-only header, an old request, a timestamp from the future and an empty secret all fail; one valid signature among several passes; one known value computed with `openssl` outside Python.
-- **Webhook handler (24 tests):** bad signatures get 400 and write nothing; a paid checkout makes one order and one message; the same event five times makes one message; two different events for one checkout make one message; four multi-event sequences end in the right state, two of them with the events arriving in the wrong order; a queue failure returns 500 and the retry queues the order; an invocation that died mid-event is finished by a later delivery; a database failure returns 500; unprocessable signed events are parked once with their reason.
+- **Signature (20 tests):** a valid signature passes; a wrong secret, a changed body, a re-serialized body, a changed timestamp, a missing or malformed header (9 cases, among them a non-ASCII signature and timestamps written as `+1` or `1_0`), a `v0`-only header, an old request, a timestamp from the future and an empty secret all fail; one valid signature among several passes; one known value computed with `openssl` outside Python.
+- **Webhook handler (27 tests):** bad signatures, a body that is not valid base64 and a non-ASCII signature get 400 and write nothing; a paid checkout makes one order and one message; the same event five times makes one message; two different events for one checkout make one message; four multi-event sequences end in the right state, two of them with the events arriving in the wrong order; a queue failure returns 500 and the retry queues the order; an invocation that died mid-event is finished by a later delivery; a database failure returns 500; unprocessable signed events, including six payloads of the wrong shape or size, are parked once with their reason.
 - **Consumer (8 tests):** the first delivery runs the step and a redelivery does not; a message for a missing or unpaid order, or a malformed message (5 cases), raises so SQS will dead-letter it.
 
-### End-to-end tests on AWS Emulator: 15 passed
+### End-to-end tests on AWS Emulator: 16 passed
 
 `scripts/e2e.sh` starts the emulator, applies the Terraform in `infra/` (18 resources), sends signed events over HTTPS through the emulated HTTP API, reads the results back through the AWS API, destroys the stack and stops the emulator. Nothing is faked on the test's side.
 
 | What was sent | Result |
 | --- | --- |
 | Unsigned request; wrong secret; body changed after signing; request signed ten minutes ago | 400 each, no order written |
+| A signature with a non-ASCII character in it | 400 from the handler, no order written |
 | One paid checkout | One order, consumer ran once |
 | An event type the handler does not handle | 200, nothing written |
 | The same event five times in a row | First applied, four reported as duplicates, consumer ran once |
@@ -69,20 +70,20 @@ All results below are from one run on 2026-11-12, on a 4-core arm64 Linux machin
 | Payment succeeded arriving before checkout completed | Stayed paid, consumer ran once |
 | Payment failed arriving before checkout completed | Stayed failed, never queued |
 | Signed event with no amount | 200, found in the dead-letter queue with its reason and the full event |
-| A message for an order that does not exist, put on the orders queue | In the dead-letter queue 32 seconds later, after three failed receives at a 10 second visibility timeout |
+| A message for an order that does not exist, put on the orders queue | In the dead-letter queue 31 seconds later, after three failed receives at a 10 second visibility timeout |
 | 50 orders, each event delivered three times, shuffled, ten requests at a time | 50 orders, each processed by the consumer exactly once |
 
 Measured in that run:
 
-- **Terraform apply:** 18 resources in 64 seconds. Destroy: 18 destroyed.
-- **Whole test run:** 15 tests in 213 seconds, most of it waiting for queues to drain.
-- **The burst:** 150 requests in 73 seconds, median 4.6 seconds per request and 6.4 seconds at the 95th percentile with ten in flight. A single request with nothing else running took about 0.35 seconds in an earlier manual check. The consumer finished all 50 orders 141 seconds after the first request. None of the 150 was answered 409.
+- **Terraform apply:** 18 resources in 65 seconds. Destroy: 18 destroyed.
+- **Whole test run:** 16 tests in 201 seconds, most of it waiting for queues to drain.
+- **The burst:** 150 requests in 65 seconds, median 4.3 seconds per request and 5.7 seconds at the 95th percentile with ten in flight. A single request with nothing else running took about 0.35 seconds in an earlier manual check. The consumer finished all 50 orders 131 seconds after the first request. None of the 150 was answered 409.
 
 These timings describe the emulator on a small machine. They say nothing about how fast this would be on AWS.
 
 ## What the emulator does not prove
 
-AWS Emulator was version 1.0.336 (released 2026-11-12, commit `f515581`), run with telemetry off. AWS publishes a score file with each release; for this version it shows about six in ten of AWS's own fidelity checks passing overall, and about half for HTTP APIs. A pass here is evidence and not acceptance.
+AWS Emulator was version 1.0.336 (released 2026-11-12, commit `f515581`), run with telemetry off. AWS publishes a score file with each release; for this version it shows about six in ten of AWS's own fidelity checks passing overall, and about half for HTTP APIs. A test that passes on the emulator can still fail on AWS.
 
 - **It has not run on AWS.** No AWS account was used at any point. The first real deployment may turn up differences.
 - **The IAM policies are untested.** The Terraform gives each function a narrow policy, but AWS says not to use the emulator to test permissions, and it does not enforce them faithfully. Whether these policies are sufficient, or as tight as they look, is only shown on AWS.
@@ -123,7 +124,7 @@ make e2e
 
 The script always starts the emulator with `--telemetry off` (it is on by default), keeps the emulator's keys and certificate under `.emulator/` in this directory, and removes the stack when it ends. `EMULATOR_PORT` changes the port from 9297. `KEEP_STACK=1` skips the destroy.
 
-CI (`.github/workflows/ci.yml`) runs ruff, the 49 unit tests, `terraform fmt -check` and `terraform validate` on every push. The end-to-end run is a local step and is not in CI.
+CI (`.github/workflows/ci.yml`) runs ruff, the 55 unit tests, `terraform fmt -check` and `terraform validate` on every push. The end-to-end run is a local step and is not in CI.
 
 ## Layout
 

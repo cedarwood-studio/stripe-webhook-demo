@@ -46,20 +46,22 @@ def verify(
     for part in header.split(","):
         key, _, value = part.strip().partition("=")
         if key == "t":
-            try:
-                timestamp = int(value)
-            except ValueError as exc:
-                raise SignatureError("malformed timestamp") from exc
+            # Digits only. int() alone would also take "+1", " 1" and "1_0".
+            if not (value.isascii() and value.isdigit() and len(value) <= 12):
+                raise SignatureError("malformed timestamp")
+            timestamp = int(value)
         elif key == "v1":
             candidates.append(value)
     if timestamp is None or not candidates:
         raise SignatureError("header has no timestamp or no v1 signature")
 
-    expected = compute(payload, secret, timestamp)
+    expected = compute(payload, secret, timestamp).encode()
     # Compare every candidate without short-circuiting on the first mismatch.
+    # Bytes, not str: compare_digest raises TypeError on a non-ASCII str, and
+    # the header is attacker-controlled.
     matched = False
     for candidate in candidates:
-        if hmac.compare_digest(expected, candidate):
+        if hmac.compare_digest(expected, candidate.encode("utf-8", "replace")):
             matched = True
     if not matched:
         raise SignatureError("signature does not match")

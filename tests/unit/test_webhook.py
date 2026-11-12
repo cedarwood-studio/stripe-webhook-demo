@@ -5,7 +5,8 @@ from __future__ import annotations
 from botocore.exceptions import ClientError
 
 from orders import signature
-from tests.events import TEST_SECRET, checkout_event, signed
+from orders.webhook import handle
+from tests.events import TEST_SECRET, checkout_event, http_api_event, signed
 
 PAID = "checkout.session.completed"
 ASYNC_OK = "checkout.session.async_payment_succeeded"
@@ -53,9 +54,32 @@ def test_base64_encoded_body_is_verified_on_the_decoded_bytes(h):
 
 
 def test_signed_body_that_is_not_an_event_is_rejected(h):
-    for raw in (b"not json", b"[]", b'{"id": 5, "type": "x"}', b'{"type": "x"}'):
+    too_long = b'{"id": "%s", "type": "checkout.session.completed"}' % (b"e" * 3000)
+    for raw in (
+        b"not json",
+        b"[]",
+        b'{"id": 5, "type": "x"}',
+        b'{"type": "x"}',
+        b'{"id": "", "type": "checkout.session.completed"}',
+        too_long,  # longer than a DynamoDB key can be
+    ):
         body, header = signed(raw, h.clock())
         assert h.post(body, header)["statusCode"] == 400
+    assert h.item_count() == 0
+
+
+def test_body_that_is_not_valid_base64_is_rejected(h):
+    request = http_api_event(b"x", f"t={h.clock()},v1=00", base64_encoded=True)
+    request["body"] = "!!! not base64"
+    assert handle(request, h.deps)["statusCode"] == 400
+    assert h.item_count() == 0
+
+
+def test_non_ascii_signature_is_rejected_and_does_not_crash(h):
+    # Anyone can send this without the secret. It must be a 400, not an
+    # unhandled TypeError that API Gateway turns into a 500.
+    body, _ = signed(checkout_event("evt_1", "cs_test_1"), h.clock())
+    assert h.post(body, f"t={h.clock()},v1=\u00e9")["statusCode"] == 400
     assert h.item_count() == 0
 
 
@@ -268,6 +292,34 @@ def test_unknown_payment_status_is_parked_not_guessed(h):
     r = h.deliver(checkout_event("evt_1", "cs_test_1", payment_status="something_new"))
     assert r["json"]["status"] == "parked"
     assert h.order("cs_test_1") is None
+
+
+def test_signed_event_of_the_wrong_shape_is_parked_not_retried_forever(h):
+    # A 500 here would have Stripe redeliver for days an event that can never
+    # succeed. Each of these is parked once and acknowledged.
+    def broken(n: int) -> dict:
+        event = checkout_event(f"evt_{n}", f"cs_test_{n}")
+        session = event["data"]["object"]
+        if n == 0:
+            event["data"] = "not an object"
+        elif n == 1:
+            event["data"]["object"] = ["not", "an", "object"]
+        elif n == 2:
+            del event["data"]
+        elif n == 3:
+            session["id"] = "c" * 3000  # longer than a DynamoDB key can be
+        elif n == 4:
+            session["amount_total"] = 10**40  # more digits than DynamoDB stores
+        elif n == 5:
+            session["amount_total"] = 49.5
+        return event
+
+    for n in range(6):
+        r = h.deliver(broken(n))
+        assert (r["statusCode"], r["json"].get("status")) == (200, "parked"), n
+        assert h.deliver(broken(n))["json"]["status"] == "duplicate"
+    assert len(h.dead_letters()) == 6
+    assert h.queued() == []
 
 
 def test_secret_is_never_echoed(h):

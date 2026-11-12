@@ -10,6 +10,7 @@ Response codes, as Stripe reads them:
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import logging
 import os
@@ -54,26 +55,47 @@ def _response(code: int, **body) -> dict:
     }
 
 
+# Stripe ids are far shorter than this. The bound keeps a key that DynamoDB
+# would refuse (2048 bytes) from turning into a 500 that Stripe retries for days.
+MAX_ID_LENGTH = 255
+# DynamoDB numbers hold 38 digits; no real amount in minor units comes close.
+MAX_AMOUNT = 10**15
+
+
+class BadRequest(Exception):
+    """The request body cannot be read at all."""
+
+
 def _raw_body(event: dict) -> bytes:
     body = event.get("body") or ""
+    if not isinstance(body, str):
+        raise BadRequest("body is not a string")
     if event.get("isBase64Encoded"):
-        return base64.b64decode(body)
+        try:
+            return base64.b64decode(body, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise BadRequest("body is not valid base64") from exc
     return body.encode()
+
+
+def _valid_id(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= MAX_ID_LENGTH
 
 
 def _order_fields(stripe_event: dict) -> tuple[str, str, int, str]:
     """Return (order id, target status, amount, currency) or raise Unprocessable."""
-    session = (stripe_event.get("data") or {}).get("object") or {}
-    if session.get("object") != "checkout.session":
+    data = stripe_event.get("data")
+    session = data.get("object") if isinstance(data, dict) else None
+    if not isinstance(session, dict) or session.get("object") != "checkout.session":
         raise Unprocessable("data.object is not a checkout session")
     order_id = session.get("id")
-    if not isinstance(order_id, str) or not order_id:
-        raise Unprocessable("checkout session has no id")
+    if not _valid_id(order_id):
+        raise Unprocessable("checkout session has no usable id")
     amount = session.get("amount_total")
     currency = session.get("currency")
-    if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
-        raise Unprocessable("amount_total is missing or not a whole number")
-    if not isinstance(currency, str) or not currency:
+    if not isinstance(amount, int) or isinstance(amount, bool) or not 0 <= amount <= MAX_AMOUNT:
+        raise Unprocessable("amount_total is missing, not a whole number or out of range")
+    if not isinstance(currency, str) or not 0 < len(currency) <= MAX_ID_LENGTH:
         raise Unprocessable("currency is missing")
 
     event_type = stripe_event["type"]
@@ -104,12 +126,12 @@ def _park(deps: Deps, stripe_event: dict, reason: str) -> None:
 
 
 def handle(event: dict, deps: Deps) -> dict:
-    payload = _raw_body(event)
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     now = deps.now()
     try:
+        payload = _raw_body(event)
         signature.verify(payload, headers.get("stripe-signature"), deps.secret, now)
-    except signature.SignatureError as exc:
+    except (BadRequest, signature.SignatureError) as exc:
         log.warning("rejected: %s", exc)
         return _response(400, error="invalid signature")
 
@@ -117,8 +139,8 @@ def handle(event: dict, deps: Deps) -> dict:
         stripe_event = json.loads(payload)
         event_id = stripe_event["id"]
         event_type = stripe_event["type"]
-        if not isinstance(event_id, str) or not isinstance(event_type, str):
-            raise TypeError("id and type must be strings")
+        if not _valid_id(event_id) or not isinstance(event_type, str):
+            raise TypeError("id and type must be strings, and id a usable key")
     except (ValueError, KeyError, TypeError):
         return _response(400, error="not a Stripe event")
 
