@@ -1,0 +1,20 @@
+[project]
+name = "stripe-webhook-demo"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests/unit"]
+markers = ["e2e: needs a running AWS Emulator with the Terraform applied (see README)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["S101"]  # assert is how pytest works
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]  # the test signing secret is made up and says so

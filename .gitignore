@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+infra/.terraform/
+infra/build/
+infra/*.tfstate*
+infra/*.tfvars
+.emulator/
